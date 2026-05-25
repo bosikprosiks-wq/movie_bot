@@ -397,7 +397,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 4.99,
             "min_votes": 20,
             "sort_by": "popularity.desc",
-            "allow_soft_search": True,
             "name": "1-4",
         },
         "⭐ 5–6": {
@@ -405,7 +404,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 6.99,
             "min_votes": 50,
             "sort_by": "popularity.desc",
-            "allow_soft_search": True,
             "name": "5-6",
         },
         "⭐ 7–8": {
@@ -413,7 +411,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 8.99,
             "min_votes": 150,
             "sort_by": "popularity.desc",
-            "allow_soft_search": True,
             "name": "7-8",
         },
         "⭐ 8+": {
@@ -421,7 +418,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 10.0,
             "min_votes": 300,
             "sort_by": "popularity.desc",
-            "allow_soft_search": False,
             "name": "8plus",
         },
         "🎲 Любой рейтинг": {
@@ -429,7 +425,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 10.0,
             "min_votes": 50,
             "sort_by": "popularity.desc",
-            "allow_soft_search": True,
             "name": "any",
         },
     }
@@ -441,7 +436,6 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 10.0,
             "min_votes": 50,
             "sort_by": "popularity.desc",
-            "allow_soft_search": True,
             "name": "any",
         }
     )
@@ -522,12 +516,46 @@ def build_filter_key(
     return f"genre={genre_id}|rating={rating_name}|year={year_name}|country={country_name}"
 
 
+def get_min_votes_steps(rating_settings: dict, country_settings: dict) -> list[int]:
+    base_votes = rating_settings["min_votes"]
+    country_code = country_settings.get("country_code")
+    rating_name = rating_settings.get("name", "any")
+
+    if country_code == "KZ":
+        if rating_name == "8plus":
+            steps = [base_votes, 50, 20, 10, 5, 0]
+        else:
+            steps = [base_votes, 20, 10, 5, 0]
+    elif country_code and country_code != "US":
+        if rating_name == "8plus":
+            steps = [base_votes, 100, 50, 20, 10, 0]
+        else:
+            steps = [base_votes, 50, 20, 10, 0]
+    elif country_code == "US":
+        if rating_name == "8plus":
+            steps = [base_votes, 150, 100, 50, 20]
+        else:
+            steps = [base_votes, 100, 50, 20, 0]
+    else:
+        if rating_name == "8plus":
+            steps = [base_votes, 150, 100, 50, 20]
+        else:
+            steps = [base_votes, 100, 50, 20, 0]
+
+    clean_steps = []
+    for step in steps:
+        if step not in clean_steps and step <= base_votes:
+            clean_steps.append(step)
+
+    return clean_steps
+
+
 def build_tmdb_params(
     genre_text: str,
     rating_settings: dict,
     year_settings: dict,
     country_settings: dict,
-    min_votes_override: int | None = None
+    min_votes: int
 ):
     genre_id = get_genre_id(genre_text)
     country_code = country_settings.get("country_code")
@@ -538,9 +566,7 @@ def build_tmdb_params(
         "sort_by": rating_settings["sort_by"],
         "vote_average.gte": rating_settings["min_rating"],
         "vote_average.lte": rating_settings["max_rating"],
-        "vote_count.gte": min_votes_override
-        if min_votes_override is not None
-        else rating_settings["min_votes"],
+        "vote_count.gte": min_votes,
         "include_adult": "false",
         "page": 1,
     }
@@ -583,12 +609,12 @@ async def collect_movies_from_pages(session: aiohttp.ClientSession, params: dict
     if total_pages <= 1:
         return movies
 
-    max_page = min(total_pages, 20)
+    max_page = min(total_pages, 30)
 
     pages = list(range(2, max_page + 1))
     random.shuffle(pages)
 
-    selected_pages = pages[:5]
+    selected_pages = pages[:8]
 
     for page in selected_pages:
         page_params = params.copy()
@@ -615,63 +641,60 @@ async def get_movie_by_filters(
     )
 
     seen_movies = get_seen_movie_ids(user_id, filter_key)
+    min_votes_steps = get_min_votes_steps(rating_settings, country_settings)
+
+    all_movies_found = []
 
     async with aiohttp.ClientSession() as session:
-        params = build_tmdb_params(
-            genre_text,
-            rating_settings,
-            year_settings,
-            country_settings
-        )
-
-        movies = await collect_movies_from_pages(session, params)
-
-        if (
-            not movies
-            and rating_settings["min_votes"] > 0
-            and rating_settings.get("allow_soft_search", True)
-        ):
-            soft_params = build_tmdb_params(
+        for min_votes in min_votes_steps:
+            params = build_tmdb_params(
                 genre_text,
                 rating_settings,
                 year_settings,
                 country_settings,
-                min_votes_override=0
+                min_votes
             )
 
-            movies = await collect_movies_from_pages(session, soft_params)
+            movies = await collect_movies_from_pages(session, params)
 
-    if not movies:
+            if not movies:
+                continue
+
+            unique_movies = {}
+            for movie in movies:
+                movie_id = movie.get("id")
+                if movie_id:
+                    unique_movies[movie_id] = movie
+
+            movies = list(unique_movies.values())
+            all_movies_found.extend(movies)
+
+            unseen_movies = [
+                movie for movie in movies
+                if movie.get("id") not in seen_movies
+            ]
+
+            if unseen_movies:
+                return {
+                    "status": "ok",
+                    "movie": random.choice(unseen_movies),
+                    "filter_key": filter_key,
+                    "used_min_votes": min_votes,
+                }
+
+    if not all_movies_found:
         return {
             "status": "not_found",
             "movie": None,
             "filter_key": filter_key,
-        }
-
-    unique_movies = {}
-    for movie in movies:
-        movie_id = movie.get("id")
-        if movie_id:
-            unique_movies[movie_id] = movie
-
-    movies = list(unique_movies.values())
-
-    unseen_movies = [
-        movie for movie in movies
-        if movie.get("id") not in seen_movies
-    ]
-
-    if unseen_movies:
-        return {
-            "status": "ok",
-            "movie": random.choice(unseen_movies),
-            "filter_key": filter_key,
+            "used_min_votes": None,
         }
 
     return {
         "status": "exhausted",
         "movie": None,
         "filter_key": filter_key,
+        "used_min_votes": None,
     }
 
 
@@ -753,13 +776,15 @@ def build_movie_text(movie: dict) -> str:
     release_date = movie.get("release_date") or "Неизвестно"
     year = release_date[:4] if release_date != "Неизвестно" else "Неизвестно"
     rating = movie.get("vote_average", "Нет рейтинга")
+    votes = movie.get("vote_count", 0)
     description = movie.get("overview") or "Описание отсутствует."
 
     return (
         f"🎬 <b>{title}</b>\n"
         f"🌍 Оригинальное название: {original_title}\n"
         f"📅 Год: {year}\n"
-        f"⭐ Рейтинг TMDB: {rating}/10\n\n"
+        f"⭐ Рейтинг TMDB: {rating}/10\n"
+        f"👥 Голосов: {votes}\n\n"
         f"📝 {description}"
     )
 
