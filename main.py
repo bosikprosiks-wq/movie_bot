@@ -314,30 +314,35 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 4.99,
             "min_votes": 20,
             "sort_by": "popularity.desc",
+            "allow_soft_search": True,
         },
         "⭐ 5–6": {
             "min_rating": 5.0,
             "max_rating": 6.99,
             "min_votes": 50,
             "sort_by": "popularity.desc",
+            "allow_soft_search": True,
         },
         "⭐ 7–8": {
             "min_rating": 7.0,
             "max_rating": 8.99,
             "min_votes": 150,
             "sort_by": "popularity.desc",
+            "allow_soft_search": True,
         },
         "⭐ 8+": {
             "min_rating": 8.0,
             "max_rating": 10.0,
-            "min_votes": 500,
-            "sort_by": "vote_average.desc",
+            "min_votes": 1000,
+            "sort_by": "popularity.desc",
+            "allow_soft_search": False,
         },
         "🎲 Любой рейтинг": {
             "min_rating": 0.0,
             "max_rating": 10.0,
             "min_votes": 50,
             "sort_by": "popularity.desc",
+            "allow_soft_search": True,
         },
     }
 
@@ -348,6 +353,7 @@ def get_rating_settings(rating_text: str) -> dict:
             "max_rating": 10.0,
             "min_votes": 50,
             "sort_by": "popularity.desc",
+            "allow_soft_search": True,
         }
     )
 
@@ -501,7 +507,11 @@ async def get_movie_by_filters(
 
         movies = await collect_movies_from_pages(session, params)
 
-        if not movies and rating_settings["min_votes"] > 0:
+        if (
+            not movies
+            and rating_settings["min_votes"] > 0
+            and rating_settings.get("allow_soft_search", True)
+        ):
             soft_params = build_tmdb_params(
                 genre_text,
                 rating_settings,
@@ -513,7 +523,10 @@ async def get_movie_by_filters(
             movies = await collect_movies_from_pages(session, soft_params)
 
     if not movies:
-        return None
+        return {
+            "status": "not_found",
+            "movie": None,
+        }
 
     unseen_movies = [
         movie for movie in movies
@@ -521,10 +534,15 @@ async def get_movie_by_filters(
     ]
 
     if unseen_movies:
-        return random.choice(unseen_movies)
+        return {
+            "status": "ok",
+            "movie": random.choice(unseen_movies),
+        }
 
-    user_seen_movies[user_id] = set()
-    return random.choice(movies)
+    return {
+        "status": "exhausted",
+        "movie": None,
+    }
 
 
 def get_movie_links(movie: dict):
@@ -564,6 +582,10 @@ def remember_seen_movie(user_id: int, movie: dict):
         user_seen_movies[user_id] = set(list(user_seen_movies[user_id])[-50:])
 
 
+def reset_seen_movies_for_user(user_id: int):
+    user_seen_movies[user_id] = set()
+
+
 def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
     kinopoisk_url, tmdb_url = get_movie_links(movie)
     movie_id = movie.get("id")
@@ -579,6 +601,19 @@ def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="🔁 Другой фильм", callback_data="another_movie"),
+            ],
+        ]
+    )
+
+
+def build_no_more_movies_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Сбросить повторы",
+                    callback_data="reset_seen_movies"
+                ),
             ],
         ]
     )
@@ -647,6 +682,26 @@ async def send_movie_card(message: Message, movie: dict):
         )
 
 
+async def send_no_movies_message(message: Message, exhausted: bool):
+    if exhausted:
+        await message.answer(
+            "По этому запросу больше нет новых фильмов 😢\n\n"
+            "Попробуй изменить фильтры:\n"
+            "• выбрать другой рейтинг;\n"
+            "• выбрать другой год;\n"
+            "• выбрать другую страну;\n"
+            "• выбрать «Любая страна» или «Любой год».\n\n"
+            "Либо можешь сбросить повторы и начать показывать фильмы заново.",
+            reply_markup=build_no_more_movies_keyboard()
+        )
+    else:
+        await message.answer(
+            "Не смог найти фильм по таким фильтрам 😢\n\n"
+            "Попробуй выбрать более широкий фильтр: "
+            "например «Любой год», «Любая страна» или другой рейтинг."
+        )
+
+
 async def send_movie(
     message: Message,
     genre_text: str,
@@ -658,7 +713,7 @@ async def send_movie(
 
     user_id = message.from_user.id
 
-    movie = await get_movie_by_filters(
+    result = await get_movie_by_filters(
         user_id,
         genre_text,
         rating_settings,
@@ -666,12 +721,15 @@ async def send_movie(
         country_settings
     )
 
-    if not movie:
-        await message.answer(
-            "Не смог найти фильм по таким фильтрам 😢\n"
-            "Попробуй выбрать более широкий год, рейтинг или любую страну."
-        )
+    if result["status"] == "not_found":
+        await send_no_movies_message(message, exhausted=False)
         return
+
+    if result["status"] == "exhausted":
+        await send_no_movies_message(message, exhausted=True)
+        return
+
+    movie = result["movie"]
 
     last_movies[user_id] = movie
     remember_seen_movie(user_id, movie)
@@ -945,7 +1003,7 @@ async def another_movie(callback: CallbackQuery):
 
     await callback.answer("Ищу другой фильм...")
 
-    movie = await get_movie_by_filters(
+    result = await get_movie_by_filters(
         user_id,
         genre_text,
         rating_settings,
@@ -953,17 +1011,40 @@ async def another_movie(callback: CallbackQuery):
         country_settings
     )
 
-    if not movie:
+    if result["status"] == "not_found":
         await callback.message.answer(
-            "Не смог найти новый фильм по таким фильтрам 😢\n"
-            "Попробуй выбрать более широкий год, рейтинг или любую страну."
+            "Не смог найти новый фильм по таким фильтрам 😢\n\n"
+            "Попробуй выбрать более широкий фильтр: "
+            "например «Любой год», «Любая страна» или другой рейтинг."
         )
         return
+
+    if result["status"] == "exhausted":
+        await callback.message.answer(
+            "По этому запросу больше нет новых фильмов 😢\n\n"
+            "Попробуй поменять жанр, рейтинг, год или страну.\n"
+            "Либо сбрось повторы и начни показ заново.",
+            reply_markup=build_no_more_movies_keyboard()
+        )
+        return
+
+    movie = result["movie"]
 
     last_movies[user_id] = movie
     remember_seen_movie(user_id, movie)
 
     await send_movie_card(callback.message, movie)
+
+
+@dp.callback_query(F.data == "reset_seen_movies")
+async def reset_seen_movies(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    reset_seen_movies_for_user(user_id)
+
+    await callback.answer("Повторы сброшены 🔄")
+    await callback.message.answer(
+        "Готово! Теперь можно снова получать фильмы по этим же фильтрам."
+    )
 
 
 @dp.callback_query(F.data.startswith("favorite:"))
@@ -1006,6 +1087,10 @@ async def delete_movie_from_favorites(callback: CallbackQuery):
         await callback.answer("Фильм уже удалён или не найден.", show_alert=True)
 
 
+async def main_page(request):
+    return web.Response(text="Movie bot is running")
+
+
 async def on_startup(bot: Bot):
     webhook_full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
     await bot.set_webhook(webhook_full_url)
@@ -1033,6 +1118,8 @@ def start_webhook_mode():
     dp.startup.register(on_startup)
 
     app = web.Application()
+
+    app.router.add_get("/", main_page)
 
     SimpleRequestHandler(
         dispatcher=dp,
