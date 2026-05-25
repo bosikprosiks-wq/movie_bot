@@ -44,7 +44,7 @@ user_last_genre = {}
 user_last_rating = {}
 user_last_year = {}
 user_last_country = {}
-user_seen_movies = {}
+user_last_filter_key = {}
 last_movies = {}
 
 
@@ -170,8 +170,12 @@ country_keyboard = ReplyKeyboardMarkup(
 )
 
 
+def get_connection():
+    return sqlite3.connect("movies.db")
+
+
 def init_db():
-    connection = sqlite3.connect("movies.db")
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
@@ -191,6 +195,18 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seen_movies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            filter_key TEXT NOT NULL,
+            movie_id INTEGER NOT NULL,
+            UNIQUE(user_id, filter_key, movie_id)
+        )
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -204,7 +220,7 @@ def add_favorite(user_id: int, movie: dict):
 
     kinopoisk_url, tmdb_url = get_movie_links(movie)
 
-    connection = sqlite3.connect("movies.db")
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
@@ -241,7 +257,7 @@ def add_favorite(user_id: int, movie: dict):
 
 
 def get_favorites(user_id: int):
-    connection = sqlite3.connect("movies.db")
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
@@ -262,7 +278,7 @@ def get_favorites(user_id: int):
 
 
 def delete_favorite(user_id: int, movie_id: int):
-    connection = sqlite3.connect("movies.db")
+    connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute(
@@ -278,6 +294,73 @@ def delete_favorite(user_id: int, movie_id: int):
     connection.close()
 
     return deleted
+
+
+def remember_seen_movie(user_id: int, filter_key: str, movie_id: int):
+    if not movie_id:
+        return
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO seen_movies (
+            user_id,
+            filter_key,
+            movie_id
+        )
+        VALUES (?, ?, ?)
+        """,
+        (user_id, filter_key, movie_id)
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def get_seen_movie_ids(user_id: int, filter_key: str):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT movie_id
+        FROM seen_movies
+        WHERE user_id = ? AND filter_key = ?
+        """,
+        (user_id, filter_key)
+    )
+
+    rows = cursor.fetchall()
+    connection.close()
+
+    return {row[0] for row in rows}
+
+
+def reset_seen_movies_for_user(user_id: int, filter_key: str | None = None):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    if filter_key:
+        cursor.execute(
+            """
+            DELETE FROM seen_movies
+            WHERE user_id = ? AND filter_key = ?
+            """,
+            (user_id, filter_key)
+        )
+    else:
+        cursor.execute(
+            """
+            DELETE FROM seen_movies
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        )
+
+    connection.commit()
+    connection.close()
 
 
 def get_genre_id(genre_text: str) -> str:
@@ -315,6 +398,7 @@ def get_rating_settings(rating_text: str) -> dict:
             "min_votes": 20,
             "sort_by": "popularity.desc",
             "allow_soft_search": True,
+            "name": "1-4",
         },
         "⭐ 5–6": {
             "min_rating": 5.0,
@@ -322,6 +406,7 @@ def get_rating_settings(rating_text: str) -> dict:
             "min_votes": 50,
             "sort_by": "popularity.desc",
             "allow_soft_search": True,
+            "name": "5-6",
         },
         "⭐ 7–8": {
             "min_rating": 7.0,
@@ -329,13 +414,15 @@ def get_rating_settings(rating_text: str) -> dict:
             "min_votes": 150,
             "sort_by": "popularity.desc",
             "allow_soft_search": True,
+            "name": "7-8",
         },
         "⭐ 8+": {
             "min_rating": 8.0,
             "max_rating": 10.0,
-            "min_votes": 1000,
+            "min_votes": 300,
             "sort_by": "popularity.desc",
             "allow_soft_search": False,
+            "name": "8plus",
         },
         "🎲 Любой рейтинг": {
             "min_rating": 0.0,
@@ -343,6 +430,7 @@ def get_rating_settings(rating_text: str) -> dict:
             "min_votes": 50,
             "sort_by": "popularity.desc",
             "allow_soft_search": True,
+            "name": "any",
         },
     }
 
@@ -354,6 +442,7 @@ def get_rating_settings(rating_text: str) -> dict:
             "min_votes": 50,
             "sort_by": "popularity.desc",
             "allow_soft_search": True,
+            "name": "any",
         }
     )
 
@@ -363,22 +452,27 @@ def get_year_settings(year_text: str) -> dict:
         "🆕 Новые 2020+": {
             "from_date": "2020-01-01",
             "to_date": "2030-12-31",
+            "name": "2020plus",
         },
         "🎞 2010–2019": {
             "from_date": "2010-01-01",
             "to_date": "2019-12-31",
+            "name": "2010-2019",
         },
         "📼 2000–2009": {
             "from_date": "2000-01-01",
             "to_date": "2009-12-31",
+            "name": "2000-2009",
         },
         "📺 До 2000": {
             "from_date": "1900-01-01",
             "to_date": "1999-12-31",
+            "name": "before2000",
         },
         "🎲 Любой год": {
             "from_date": None,
             "to_date": None,
+            "name": "any",
         },
     }
 
@@ -387,6 +481,7 @@ def get_year_settings(year_text: str) -> dict:
         {
             "from_date": None,
             "to_date": None,
+            "name": "any",
         }
     )
 
@@ -405,9 +500,26 @@ def get_country_settings(country_text: str) -> dict:
         "🇩🇪 Германия": "DE",
     }
 
+    country_code = countries.get(country_text)
+
     return {
-        "country_code": countries.get(country_text)
+        "country_code": country_code,
+        "name": country_code or "any",
     }
+
+
+def build_filter_key(
+    genre_text: str,
+    rating_settings: dict,
+    year_settings: dict,
+    country_settings: dict
+) -> str:
+    genre_id = get_genre_id(genre_text) or "any"
+    rating_name = rating_settings.get("name", "any")
+    year_name = year_settings.get("name", "any")
+    country_name = country_settings.get("name", "any")
+
+    return f"genre={genre_id}|rating={rating_name}|year={year_name}|country={country_name}"
 
 
 def build_tmdb_params(
@@ -495,7 +607,14 @@ async def get_movie_by_filters(
     year_settings: dict,
     country_settings: dict
 ):
-    seen_movies = user_seen_movies.get(user_id, set())
+    filter_key = build_filter_key(
+        genre_text,
+        rating_settings,
+        year_settings,
+        country_settings
+    )
+
+    seen_movies = get_seen_movie_ids(user_id, filter_key)
 
     async with aiohttp.ClientSession() as session:
         params = build_tmdb_params(
@@ -526,7 +645,16 @@ async def get_movie_by_filters(
         return {
             "status": "not_found",
             "movie": None,
+            "filter_key": filter_key,
         }
+
+    unique_movies = {}
+    for movie in movies:
+        movie_id = movie.get("id")
+        if movie_id:
+            unique_movies[movie_id] = movie
+
+    movies = list(unique_movies.values())
 
     unseen_movies = [
         movie for movie in movies
@@ -537,11 +665,13 @@ async def get_movie_by_filters(
         return {
             "status": "ok",
             "movie": random.choice(unseen_movies),
+            "filter_key": filter_key,
         }
 
     return {
         "status": "exhausted",
         "movie": None,
+        "filter_key": filter_key,
     }
 
 
@@ -565,25 +695,6 @@ def get_poster_url(movie: dict):
         return None
 
     return f"https://image.tmdb.org/t/p/w500{poster_path}"
-
-
-def remember_seen_movie(user_id: int, movie: dict):
-    movie_id = movie.get("id")
-
-    if not movie_id:
-        return
-
-    if user_id not in user_seen_movies:
-        user_seen_movies[user_id] = set()
-
-    user_seen_movies[user_id].add(movie_id)
-
-    if len(user_seen_movies[user_id]) > 100:
-        user_seen_movies[user_id] = set(list(user_seen_movies[user_id])[-50:])
-
-
-def reset_seen_movies_for_user(user_id: int):
-    user_seen_movies[user_id] = set()
 
 
 def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
@@ -721,6 +832,8 @@ async def send_movie(
         country_settings
     )
 
+    user_last_filter_key[user_id] = result["filter_key"]
+
     if result["status"] == "not_found":
         await send_no_movies_message(message, exhausted=False)
         return
@@ -730,9 +843,12 @@ async def send_movie(
         return
 
     movie = result["movie"]
+    movie_id = movie.get("id")
 
     last_movies[user_id] = movie
-    remember_seen_movie(user_id, movie)
+
+    if movie_id:
+        remember_seen_movie(user_id, result["filter_key"], movie_id)
 
     await send_movie_card(message, movie)
 
@@ -984,12 +1100,14 @@ async def another_movie(callback: CallbackQuery):
         {
             "from_date": None,
             "to_date": None,
+            "name": "any",
         }
     )
     country_settings = user_last_country.get(
         user_id,
         {
             "country_code": None,
+            "name": "any",
         }
     )
 
@@ -1011,6 +1129,8 @@ async def another_movie(callback: CallbackQuery):
         country_settings
     )
 
+    user_last_filter_key[user_id] = result["filter_key"]
+
     if result["status"] == "not_found":
         await callback.message.answer(
             "Не смог найти новый фильм по таким фильтрам 😢\n\n"
@@ -1029,9 +1149,12 @@ async def another_movie(callback: CallbackQuery):
         return
 
     movie = result["movie"]
+    movie_id = movie.get("id")
 
     last_movies[user_id] = movie
-    remember_seen_movie(user_id, movie)
+
+    if movie_id:
+        remember_seen_movie(user_id, result["filter_key"], movie_id)
 
     await send_movie_card(callback.message, movie)
 
@@ -1039,7 +1162,9 @@ async def another_movie(callback: CallbackQuery):
 @dp.callback_query(F.data == "reset_seen_movies")
 async def reset_seen_movies(callback: CallbackQuery):
     user_id = callback.from_user.id
-    reset_seen_movies_for_user(user_id)
+    filter_key = user_last_filter_key.get(user_id)
+
+    reset_seen_movies_for_user(user_id, filter_key)
 
     await callback.answer("Повторы сброшены 🔄")
     await callback.message.answer(
