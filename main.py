@@ -1,0 +1,881 @@
+import asyncio
+import logging
+import os
+import random
+import sqlite3
+from urllib.parse import quote_plus
+
+import aiohttp
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+WEBHOOK_PATH = "/webhook"
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = int(os.getenv("PORT", 8000))
+
+if not BOT_TOKEN:
+    raise ValueError("Не найден BOT_TOKEN. Проверь файл .env")
+
+if not TMDB_API_KEY:
+    raise ValueError("Не найден TMDB_API_KEY. Проверь файл .env")
+
+
+dp = Dispatcher()
+
+user_last_genre = {}
+user_last_rating = {}
+user_last_year = {}
+user_seen_movies = {}
+last_movies = {}
+
+
+main_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🎬 Подобрать фильм"),
+        ],
+        [
+            KeyboardButton(text="⭐ Избранное"),
+            KeyboardButton(text="ℹ️ Помощь"),
+        ],
+    ],
+    resize_keyboard=True
+)
+
+
+genre_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🎭 Любой жанр"),
+            KeyboardButton(text="😂 Комедия"),
+        ],
+        [
+            KeyboardButton(text="🚀 Фантастика"),
+            KeyboardButton(text="😱 Ужасы"),
+        ],
+        [
+            KeyboardButton(text="🔫 Боевик"),
+            KeyboardButton(text="🧨 Триллер"),
+        ],
+        [
+            KeyboardButton(text="🕵️ Детектив"),
+            KeyboardButton(text="🧟 Криминал"),
+        ],
+        [
+            KeyboardButton(text="❤️ Романтика"),
+            KeyboardButton(text="🐉 Фэнтези"),
+        ],
+        [
+            KeyboardButton(text="🎬 Драма"),
+            KeyboardButton(text="🗺 Приключения"),
+        ],
+        [
+            KeyboardButton(text="🧒 Семейный"),
+            KeyboardButton(text="🎞 Мультфильм"),
+        ],
+        [
+            KeyboardButton(text="📚 История"),
+            KeyboardButton(text="⚔️ Военный"),
+        ],
+        [
+            KeyboardButton(text="🎵 Музыка"),
+            KeyboardButton(text="📺 Документальный"),
+        ],
+        [
+            KeyboardButton(text="🤠 Вестерн"),
+            KeyboardButton(text="📺 ТВ-фильм"),
+        ],
+        [
+            KeyboardButton(text="⬅️ Назад"),
+        ],
+    ],
+    resize_keyboard=True
+)
+
+
+rating_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="⭐ 1–4"),
+            KeyboardButton(text="⭐ 5–6"),
+        ],
+        [
+            KeyboardButton(text="⭐ 7–8"),
+            KeyboardButton(text="⭐ 8+"),
+        ],
+        [
+            KeyboardButton(text="🎲 Любой рейтинг"),
+        ],
+        [
+            KeyboardButton(text="⬅️ Назад к жанрам"),
+        ],
+    ],
+    resize_keyboard=True
+)
+
+
+year_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🆕 Новые 2020+"),
+            KeyboardButton(text="🎞 2010–2019"),
+        ],
+        [
+            KeyboardButton(text="📼 2000–2009"),
+            KeyboardButton(text="📺 До 2000"),
+        ],
+        [
+            KeyboardButton(text="🎲 Любой год"),
+        ],
+        [
+            KeyboardButton(text="⬅️ Назад к рейтингу"),
+        ],
+    ],
+    resize_keyboard=True
+)
+
+
+def init_db():
+    connection = sqlite3.connect("movies.db")
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            movie_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            original_title TEXT,
+            year TEXT,
+            rating TEXT,
+            tmdb_url TEXT,
+            kinopoisk_url TEXT,
+            UNIQUE(user_id, movie_id)
+        )
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def add_favorite(user_id: int, movie: dict):
+    title = movie.get("title") or movie.get("original_title") or "Без названия"
+    original_title = movie.get("original_title") or title
+    release_date = movie.get("release_date") or "Неизвестно"
+    year = release_date[:4] if release_date != "Неизвестно" else "Неизвестно"
+    rating = str(movie.get("vote_average", "Нет рейтинга"))
+
+    kinopoisk_url, tmdb_url = get_movie_links(movie)
+
+    connection = sqlite3.connect("movies.db")
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO favorites (
+            user_id,
+            movie_id,
+            title,
+            original_title,
+            year,
+            rating,
+            tmdb_url,
+            kinopoisk_url
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            movie.get("id"),
+            title,
+            original_title,
+            year,
+            rating,
+            tmdb_url,
+            kinopoisk_url,
+        )
+    )
+
+    connection.commit()
+    added = cursor.rowcount > 0
+    connection.close()
+
+    return added
+
+
+def get_favorites(user_id: int):
+    connection = sqlite3.connect("movies.db")
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url
+        FROM favorites
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (user_id,)
+    )
+
+    rows = cursor.fetchall()
+    connection.close()
+
+    return rows
+
+
+def delete_favorite(user_id: int, movie_id: int):
+    connection = sqlite3.connect("movies.db")
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        DELETE FROM favorites
+        WHERE user_id = ? AND movie_id = ?
+        """,
+        (user_id, movie_id)
+    )
+
+    connection.commit()
+    deleted = cursor.rowcount > 0
+    connection.close()
+
+    return deleted
+
+
+def get_genre_id(genre_text: str) -> str:
+    genres = {
+        "🎭 Любой жанр": "",
+        "😂 Комедия": "35",
+        "🚀 Фантастика": "878",
+        "😱 Ужасы": "27",
+        "🔫 Боевик": "28",
+        "🧨 Триллер": "53",
+        "🕵️ Детектив": "9648",
+        "🧟 Криминал": "80",
+        "❤️ Романтика": "10749",
+        "🐉 Фэнтези": "14",
+        "🎬 Драма": "18",
+        "🗺 Приключения": "12",
+        "🧒 Семейный": "10751",
+        "🎞 Мультфильм": "16",
+        "📚 История": "36",
+        "⚔️ Военный": "10752",
+        "🎵 Музыка": "10402",
+        "📺 Документальный": "99",
+        "🤠 Вестерн": "37",
+        "📺 ТВ-фильм": "10770",
+    }
+
+    return genres.get(genre_text, "")
+
+
+def get_rating_settings(rating_text: str) -> dict:
+    settings = {
+        "⭐ 1–4": {
+            "min_rating": 1.0,
+            "max_rating": 4.99,
+            "min_votes": 50,
+            "sort_by": "popularity.desc",
+        },
+        "⭐ 5–6": {
+            "min_rating": 5.0,
+            "max_rating": 6.99,
+            "min_votes": 100,
+            "sort_by": "popularity.desc",
+        },
+        "⭐ 7–8": {
+            "min_rating": 7.0,
+            "max_rating": 8.99,
+            "min_votes": 300,
+            "sort_by": "popularity.desc",
+        },
+        "⭐ 8+": {
+            "min_rating": 8.0,
+            "max_rating": 10.0,
+            "min_votes": 1000,
+            "sort_by": "vote_average.desc",
+        },
+        "🎲 Любой рейтинг": {
+            "min_rating": 0.0,
+            "max_rating": 10.0,
+            "min_votes": 100,
+            "sort_by": "popularity.desc",
+        },
+    }
+
+    return settings.get(
+        rating_text,
+        {
+            "min_rating": 0.0,
+            "max_rating": 10.0,
+            "min_votes": 100,
+            "sort_by": "popularity.desc",
+        }
+    )
+
+
+def get_year_settings(year_text: str) -> dict:
+    settings = {
+        "🆕 Новые 2020+": {
+            "from_date": "2020-01-01",
+            "to_date": "2030-12-31",
+        },
+        "🎞 2010–2019": {
+            "from_date": "2010-01-01",
+            "to_date": "2019-12-31",
+        },
+        "📼 2000–2009": {
+            "from_date": "2000-01-01",
+            "to_date": "2009-12-31",
+        },
+        "📺 До 2000": {
+            "from_date": "1900-01-01",
+            "to_date": "1999-12-31",
+        },
+        "🎲 Любой год": {
+            "from_date": None,
+            "to_date": None,
+        },
+    }
+
+    return settings.get(
+        year_text,
+        {
+            "from_date": None,
+            "to_date": None,
+        }
+    )
+
+
+async def get_movie_by_genre(
+    user_id: int,
+    genre_text: str,
+    rating_settings: dict,
+    year_settings: dict
+):
+    genre_id = get_genre_id(genre_text)
+
+    seen_movies = user_seen_movies.get(user_id, set())
+
+    for _ in range(5):
+        params = {
+            "api_key": TMDB_API_KEY,
+            "language": "ru-RU",
+            "sort_by": rating_settings["sort_by"],
+            "vote_average.gte": rating_settings["min_rating"],
+            "vote_average.lte": rating_settings["max_rating"],
+            "vote_count.gte": rating_settings["min_votes"],
+            "include_adult": "false",
+            "page": random.randint(1, 10),
+        }
+
+        if genre_id:
+            params["with_genres"] = genre_id
+
+        if year_settings["from_date"]:
+            params["primary_release_date.gte"] = year_settings["from_date"]
+
+        if year_settings["to_date"]:
+            params["primary_release_date.lte"] = year_settings["to_date"]
+
+        url = "https://api.themoviedb.org/3/discover/movie"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status != 200:
+                    return None
+
+                data = await response.json()
+                movies = data.get("results", [])
+
+                if not movies:
+                    continue
+
+                unseen_movies = [
+                    movie for movie in movies
+                    if movie.get("id") not in seen_movies
+                ]
+
+                if unseen_movies:
+                    return random.choice(unseen_movies)
+
+    return None
+
+
+def get_movie_links(movie: dict):
+    title = movie.get("title") or movie.get("original_title") or "Без названия"
+    release_date = movie.get("release_date") or "Неизвестно"
+    year = release_date[:4] if release_date != "Неизвестно" else ""
+
+    kinopoisk_query = quote_plus(f"{title} {year}")
+    kinopoisk_url = f"https://www.kinopoisk.ru/index.php?kp_query={kinopoisk_query}"
+
+    tmdb_url = f"https://www.themoviedb.org/movie/{movie.get('id')}"
+
+    return kinopoisk_url, tmdb_url
+
+
+def get_poster_url(movie: dict):
+    poster_path = movie.get("poster_path")
+
+    if not poster_path:
+        return None
+
+    return f"https://image.tmdb.org/t/p/w500{poster_path}"
+
+
+def remember_seen_movie(user_id: int, movie: dict):
+    movie_id = movie.get("id")
+
+    if not movie_id:
+        return
+
+    if user_id not in user_seen_movies:
+        user_seen_movies[user_id] = set()
+
+    user_seen_movies[user_id].add(movie_id)
+
+    if len(user_seen_movies[user_id]) > 100:
+        user_seen_movies[user_id] = set(list(user_seen_movies[user_id])[-50:])
+
+
+def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
+    kinopoisk_url, tmdb_url = get_movie_links(movie)
+    movie_id = movie.get("id")
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔎 КиноПоиск", url=kinopoisk_url),
+                InlineKeyboardButton(text="🌐 TMDB", url=tmdb_url),
+            ],
+            [
+                InlineKeyboardButton(text="⭐ В избранное", callback_data=f"favorite:{movie_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🔁 Другой фильм", callback_data="another_movie"),
+            ],
+        ]
+    )
+
+
+def build_favorite_keyboard(movie_id: int, kinopoisk_url: str, tmdb_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔎 КиноПоиск", url=kinopoisk_url),
+                InlineKeyboardButton(text="🌐 TMDB", url=tmdb_url),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить из избранного",
+                    callback_data=f"delete_favorite:{movie_id}"
+                ),
+            ],
+        ]
+    )
+
+
+def build_movie_text(movie: dict) -> str:
+    title = movie.get("title") or movie.get("original_title") or "Без названия"
+    original_title = movie.get("original_title") or title
+    release_date = movie.get("release_date") or "Неизвестно"
+    year = release_date[:4] if release_date != "Неизвестно" else "Неизвестно"
+    rating = movie.get("vote_average", "Нет рейтинга")
+    description = movie.get("overview") or "Описание отсутствует."
+
+    return (
+        f"🎬 <b>{title}</b>\n"
+        f"🌍 Оригинальное название: {original_title}\n"
+        f"📅 Год: {year}\n"
+        f"⭐ Рейтинг TMDB: {rating}/10\n\n"
+        f"📝 {description}"
+    )
+
+
+def build_favorite_text(title: str, original_title: str, year: str, rating: str) -> str:
+    return (
+        f"🎬 <b>{title}</b>\n"
+        f"🌍 Оригинальное название: {original_title}\n"
+        f"📅 Год: {year}\n"
+        f"⭐ Рейтинг TMDB: {rating}/10"
+    )
+
+
+async def send_movie_card(message: Message, movie: dict):
+    movie_text = build_movie_text(movie)
+    movie_keyboard = build_movie_keyboard(movie)
+    poster_url = get_poster_url(movie)
+
+    if poster_url:
+        await message.answer_photo(
+            photo=poster_url,
+            caption=movie_text,
+            parse_mode="HTML",
+            reply_markup=movie_keyboard
+        )
+    else:
+        await message.answer(
+            movie_text,
+            parse_mode="HTML",
+            reply_markup=movie_keyboard
+        )
+
+
+async def send_movie(
+    message: Message,
+    genre_text: str,
+    rating_settings: dict,
+    year_settings: dict
+):
+    await message.answer("Ищу фильм... 🎬")
+
+    user_id = message.from_user.id
+
+    movie = await get_movie_by_genre(
+        user_id,
+        genre_text,
+        rating_settings,
+        year_settings
+    )
+
+    if not movie:
+        await message.answer(
+            "Не смог найти новый фильм 😢\n"
+            "Попробуй выбрать другой жанр, рейтинг или год."
+        )
+        return
+
+    last_movies[user_id] = movie
+    remember_seen_movie(user_id, movie)
+
+    await send_movie_card(message, movie)
+
+
+@dp.message(CommandStart())
+async def start_command(message: Message):
+    await message.answer(
+        "Привет! 🎬\n\n"
+        "Я бот «Что посмотреть вечером».\n"
+        "Помогу подобрать фильм по жанру, рейтингу и году 😎\n\n"
+        "Выбери действие на клавиатуре ниже:",
+        reply_markup=main_keyboard
+    )
+
+
+@dp.message(F.text == "🎬 Подобрать фильм")
+async def choose_movie(message: Message):
+    await message.answer(
+        "Выбери жанр фильма:",
+        reply_markup=genre_keyboard
+    )
+
+
+@dp.message(F.text == "⭐ Избранное")
+async def favorites(message: Message):
+    rows = get_favorites(message.from_user.id)
+
+    if not rows:
+        await message.answer(
+            "У тебя пока нет избранных фильмов ⭐\n\n"
+            "Выбери фильм и нажми кнопку «⭐ В избранное»."
+        )
+        return
+
+    await message.answer("⭐ <b>Твоё избранное:</b>", parse_mode="HTML")
+
+    for row in rows:
+        movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url = row
+
+        await message.answer(
+            build_favorite_text(title, original_title, year, rating),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=build_favorite_keyboard(movie_id, kinopoisk_url, tmdb_url)
+        )
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def help_message(message: Message):
+    await message.answer(
+        "Я помогу подобрать фильм по жанру, рейтингу и году.\n\n"
+        "Нажми «🎬 Подобрать фильм», выбери жанр, "
+        "потом диапазон рейтинга, потом год, "
+        "и я найду фильм через TMDB API.\n\n"
+        "Понравился фильм? Нажми «⭐ В избранное», "
+        "и он сохранится в твоём списке.\n\n"
+        "В разделе «⭐ Избранное» можно удалить конкретный фильм."
+    )
+
+
+@dp.message(F.text == "⬅️ Назад")
+async def back_to_menu(message: Message):
+    await message.answer(
+        "Вернул тебя в главное меню.",
+        reply_markup=main_keyboard
+    )
+
+
+@dp.message(F.text == "⬅️ Назад к жанрам")
+async def back_to_genres(message: Message):
+    await message.answer(
+        "Выбери жанр фильма:",
+        reply_markup=genre_keyboard
+    )
+
+
+@dp.message(F.text == "⬅️ Назад к рейтингу")
+async def back_to_rating(message: Message):
+    await message.answer(
+        "Выбери диапазон рейтинга фильма:",
+        reply_markup=rating_keyboard
+    )
+
+
+@dp.message(F.text.in_([
+    "🎭 Любой жанр",
+    "😂 Комедия",
+    "🚀 Фантастика",
+    "😱 Ужасы",
+    "🔫 Боевик",
+    "🧨 Триллер",
+    "🕵️ Детектив",
+    "🧟 Криминал",
+    "❤️ Романтика",
+    "🐉 Фэнтези",
+    "🎬 Драма",
+    "🗺 Приключения",
+    "🧒 Семейный",
+    "🎞 Мультфильм",
+    "📚 История",
+    "⚔️ Военный",
+    "🎵 Музыка",
+    "📺 Документальный",
+    "🤠 Вестерн",
+    "📺 ТВ-фильм",
+]))
+async def genre_selected(message: Message):
+    user_id = message.from_user.id
+    user_last_genre[user_id] = message.text
+
+    await message.answer(
+        "Теперь выбери диапазон рейтинга фильма:",
+        reply_markup=rating_keyboard
+    )
+
+
+@dp.message(F.text.in_([
+    "⭐ 1–4",
+    "⭐ 5–6",
+    "⭐ 7–8",
+    "⭐ 8+",
+    "🎲 Любой рейтинг",
+]))
+async def rating_selected(message: Message):
+    user_id = message.from_user.id
+    genre_text = user_last_genre.get(user_id)
+
+    if not genre_text:
+        await message.answer(
+            "Сначала выбери жанр 🎬",
+            reply_markup=genre_keyboard
+        )
+        return
+
+    rating_settings = get_rating_settings(message.text)
+    user_last_rating[user_id] = rating_settings
+
+    await message.answer(
+        "Теперь выбери год выпуска:",
+        reply_markup=year_keyboard
+    )
+
+
+@dp.message(F.text.in_([
+    "🆕 Новые 2020+",
+    "🎞 2010–2019",
+    "📼 2000–2009",
+    "📺 До 2000",
+    "🎲 Любой год",
+]))
+async def year_selected(message: Message):
+    user_id = message.from_user.id
+
+    genre_text = user_last_genre.get(user_id)
+    rating_settings = user_last_rating.get(user_id)
+
+    if not genre_text:
+        await message.answer(
+            "Сначала выбери жанр 🎬",
+            reply_markup=genre_keyboard
+        )
+        return
+
+    if not rating_settings:
+        await message.answer(
+            "Сначала выбери рейтинг ⭐",
+            reply_markup=rating_keyboard
+        )
+        return
+
+    year_settings = get_year_settings(message.text)
+    user_last_year[user_id] = year_settings
+
+    await send_movie(message, genre_text, rating_settings, year_settings)
+
+
+@dp.callback_query(F.data == "another_movie")
+async def another_movie(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    genre_text = user_last_genre.get(user_id)
+    rating_settings = user_last_rating.get(user_id)
+    year_settings = user_last_year.get(
+        user_id,
+        {
+            "from_date": None,
+            "to_date": None,
+        }
+    )
+
+    if not genre_text:
+        await callback.answer("Сначала выбери жанр 🎬", show_alert=True)
+        return
+
+    if not rating_settings:
+        await callback.answer("Сначала выбери рейтинг ⭐", show_alert=True)
+        return
+
+    await callback.answer("Ищу другой фильм...")
+
+    movie = await get_movie_by_genre(
+        user_id,
+        genre_text,
+        rating_settings,
+        year_settings
+    )
+
+    if not movie:
+        await callback.message.answer(
+            "Не смог найти новый фильм 😢\n"
+            "Попробуй выбрать другой жанр, рейтинг или год."
+        )
+        return
+
+    last_movies[user_id] = movie
+    remember_seen_movie(user_id, movie)
+
+    await send_movie_card(callback.message, movie)
+
+
+@dp.callback_query(F.data.startswith("favorite:"))
+async def add_movie_to_favorites(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    movie = last_movies.get(user_id)
+
+    if not movie:
+        await callback.answer("Сначала получи фильм 🎬", show_alert=True)
+        return
+
+    added = add_favorite(user_id, movie)
+
+    if added:
+        await callback.answer("Фильм добавлен в избранное ⭐")
+    else:
+        await callback.answer("Этот фильм уже есть в избранном ⭐", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("delete_favorite:"))
+async def delete_movie_from_favorites(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    movie_id_text = callback.data.split(":")[1]
+
+    try:
+        movie_id = int(movie_id_text)
+    except ValueError:
+        await callback.answer("Ошибка удаления 😢", show_alert=True)
+        return
+
+    deleted = delete_favorite(user_id, movie_id)
+
+    if deleted:
+        await callback.answer("Фильм удалён из избранного 🗑")
+        await callback.message.edit_text(
+            "🗑 Фильм удалён из избранного.",
+            reply_markup=None
+        )
+    else:
+        await callback.answer("Фильм уже удалён или не найден.", show_alert=True)
+
+
+async def on_startup(bot: Bot):
+    webhook_full_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(webhook_full_url)
+    logging.info(f"Webhook установлен: {webhook_full_url}")
+
+
+async def start_polling_mode():
+    logging.basicConfig(level=logging.INFO)
+
+    init_db()
+
+    bot = Bot(token=BOT_TOKEN)
+
+    logging.info("Запуск в режиме polling")
+    await dp.start_polling(bot)
+
+
+def start_webhook_mode():
+    logging.basicConfig(level=logging.INFO)
+
+    init_db()
+
+    bot = Bot(token=BOT_TOKEN)
+
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    logging.info("Запуск в режиме webhook")
+    logging.info(f"Сервер запущен на порту {WEB_SERVER_PORT}")
+
+    web.run_app(
+        app,
+        host=WEB_SERVER_HOST,
+        port=WEB_SERVER_PORT
+    )
+
+
+if __name__ == "__main__":
+    if WEBHOOK_URL:
+        start_webhook_mode()
+    else:
+        asyncio.run(start_polling_mode())
