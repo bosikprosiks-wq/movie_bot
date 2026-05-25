@@ -43,6 +43,7 @@ dp = Dispatcher()
 user_last_genre = {}
 user_last_rating = {}
 user_last_year = {}
+user_last_country = {}
 user_seen_movies = {}
 last_movies = {}
 
@@ -147,6 +148,36 @@ year_keyboard = ReplyKeyboardMarkup(
         ],
         [
             KeyboardButton(text="⬅️ Назад к рейтингу"),
+        ],
+    ],
+    resize_keyboard=True
+)
+
+
+country_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🌍 Любая страна"),
+            KeyboardButton(text="🇰🇿 Казахстан"),
+        ],
+        [
+            KeyboardButton(text="🇷🇺 Россия"),
+            KeyboardButton(text="🇺🇸 США"),
+        ],
+        [
+            KeyboardButton(text="🇬🇧 Великобритания"),
+            KeyboardButton(text="🇫🇷 Франция"),
+        ],
+        [
+            KeyboardButton(text="🇯🇵 Япония"),
+            KeyboardButton(text="🇰🇷 Корея"),
+        ],
+        [
+            KeyboardButton(text="🇮🇳 Индия"),
+            KeyboardButton(text="🇩🇪 Германия"),
+        ],
+        [
+            KeyboardButton(text="⬅️ Назад к году"),
         ],
     ],
     resize_keyboard=True
@@ -368,13 +399,34 @@ def get_year_settings(year_text: str) -> dict:
     )
 
 
-async def get_movie_by_genre(
+def get_country_settings(country_text: str) -> dict:
+    countries = {
+        "🌍 Любая страна": None,
+        "🇰🇿 Казахстан": "KZ",
+        "🇷🇺 Россия": "RU",
+        "🇺🇸 США": "US",
+        "🇬🇧 Великобритания": "GB",
+        "🇫🇷 Франция": "FR",
+        "🇯🇵 Япония": "JP",
+        "🇰🇷 Корея": "KR",
+        "🇮🇳 Индия": "IN",
+        "🇩🇪 Германия": "DE",
+    }
+
+    return {
+        "country_code": countries.get(country_text)
+    }
+
+
+async def get_movie_by_filters(
     user_id: int,
     genre_text: str,
     rating_settings: dict,
-    year_settings: dict
+    year_settings: dict,
+    country_settings: dict
 ):
     genre_id = get_genre_id(genre_text)
+    country_code = country_settings.get("country_code")
 
     seen_movies = user_seen_movies.get(user_id, set())
 
@@ -398,6 +450,9 @@ async def get_movie_by_genre(
 
         if year_settings["to_date"]:
             params["primary_release_date.lte"] = year_settings["to_date"]
+
+        if country_code:
+            params["with_origin_country"] = country_code
 
         url = "https://api.themoviedb.org/3/discover/movie"
 
@@ -547,23 +602,25 @@ async def send_movie(
     message: Message,
     genre_text: str,
     rating_settings: dict,
-    year_settings: dict
+    year_settings: dict,
+    country_settings: dict
 ):
     await message.answer("Ищу фильм... 🎬")
 
     user_id = message.from_user.id
 
-    movie = await get_movie_by_genre(
+    movie = await get_movie_by_filters(
         user_id,
         genre_text,
         rating_settings,
-        year_settings
+        year_settings,
+        country_settings
     )
 
     if not movie:
         await message.answer(
             "Не смог найти новый фильм 😢\n"
-            "Попробуй выбрать другой жанр, рейтинг или год."
+            "Попробуй выбрать другой жанр, рейтинг, год или страну."
         )
         return
 
@@ -578,7 +635,7 @@ async def start_command(message: Message):
     await message.answer(
         "Привет! 🎬\n\n"
         "Я бот «Что посмотреть вечером».\n"
-        "Помогу подобрать фильм по жанру, рейтингу и году 😎\n\n"
+        "Помогу подобрать фильм по жанру, рейтингу, году и стране 😎\n\n"
         "Выбери действие на клавиатуре ниже:",
         reply_markup=main_keyboard
     )
@@ -619,9 +676,9 @@ async def favorites(message: Message):
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_message(message: Message):
     await message.answer(
-        "Я помогу подобрать фильм по жанру, рейтингу и году.\n\n"
+        "Я помогу подобрать фильм по жанру, рейтингу, году и стране.\n\n"
         "Нажми «🎬 Подобрать фильм», выбери жанр, "
-        "потом диапазон рейтинга, потом год, "
+        "потом диапазон рейтинга, год и страну, "
         "и я найду фильм через TMDB API.\n\n"
         "Понравился фильм? Нажми «⭐ В избранное», "
         "и он сохранится в твоём списке.\n\n"
@@ -650,6 +707,14 @@ async def back_to_rating(message: Message):
     await message.answer(
         "Выбери диапазон рейтинга фильма:",
         reply_markup=rating_keyboard
+    )
+
+
+@dp.message(F.text == "⬅️ Назад к году")
+async def back_to_year(message: Message):
+    await message.answer(
+        "Выбери год выпуска:",
+        reply_markup=year_keyboard
     )
 
 
@@ -742,7 +807,62 @@ async def year_selected(message: Message):
     year_settings = get_year_settings(message.text)
     user_last_year[user_id] = year_settings
 
-    await send_movie(message, genre_text, rating_settings, year_settings)
+    await message.answer(
+        "Теперь выбери страну производства:",
+        reply_markup=country_keyboard
+    )
+
+
+@dp.message(F.text.in_([
+    "🌍 Любая страна",
+    "🇰🇿 Казахстан",
+    "🇷🇺 Россия",
+    "🇺🇸 США",
+    "🇬🇧 Великобритания",
+    "🇫🇷 Франция",
+    "🇯🇵 Япония",
+    "🇰🇷 Корея",
+    "🇮🇳 Индия",
+    "🇩🇪 Германия",
+]))
+async def country_selected(message: Message):
+    user_id = message.from_user.id
+
+    genre_text = user_last_genre.get(user_id)
+    rating_settings = user_last_rating.get(user_id)
+    year_settings = user_last_year.get(user_id)
+
+    if not genre_text:
+        await message.answer(
+            "Сначала выбери жанр 🎬",
+            reply_markup=genre_keyboard
+        )
+        return
+
+    if not rating_settings:
+        await message.answer(
+            "Сначала выбери рейтинг ⭐",
+            reply_markup=rating_keyboard
+        )
+        return
+
+    if not year_settings:
+        await message.answer(
+            "Сначала выбери год 📅",
+            reply_markup=year_keyboard
+        )
+        return
+
+    country_settings = get_country_settings(message.text)
+    user_last_country[user_id] = country_settings
+
+    await send_movie(
+        message,
+        genre_text,
+        rating_settings,
+        year_settings,
+        country_settings
+    )
 
 
 @dp.callback_query(F.data == "another_movie")
@@ -758,6 +878,12 @@ async def another_movie(callback: CallbackQuery):
             "to_date": None,
         }
     )
+    country_settings = user_last_country.get(
+        user_id,
+        {
+            "country_code": None,
+        }
+    )
 
     if not genre_text:
         await callback.answer("Сначала выбери жанр 🎬", show_alert=True)
@@ -769,17 +895,18 @@ async def another_movie(callback: CallbackQuery):
 
     await callback.answer("Ищу другой фильм...")
 
-    movie = await get_movie_by_genre(
+    movie = await get_movie_by_filters(
         user_id,
         genre_text,
         rating_settings,
-        year_settings
+        year_settings,
+        country_settings
     )
 
     if not movie:
         await callback.message.answer(
             "Не смог найти новый фильм 😢\n"
-            "Попробуй выбрать другой жанр, рейтинг или год."
+            "Попробуй выбрать другой жанр, рейтинг, год или страну."
         )
         return
 
