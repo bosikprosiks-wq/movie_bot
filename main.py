@@ -50,9 +50,7 @@ last_movies = {}
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [
-            KeyboardButton(text="🎬 Подобрать фильм"),
-        ],
+        [KeyboardButton(text="🎬 Подобрать фильм")],
         [
             KeyboardButton(text="⭐ Избранное"),
             KeyboardButton(text="ℹ️ Помощь"),
@@ -104,9 +102,7 @@ genre_keyboard = ReplyKeyboardMarkup(
             KeyboardButton(text="🤠 Вестерн"),
             KeyboardButton(text="📺 ТВ-фильм"),
         ],
-        [
-            KeyboardButton(text="⬅️ Назад"),
-        ],
+        [KeyboardButton(text="⬅️ Назад")],
     ],
     resize_keyboard=True
 )
@@ -122,12 +118,8 @@ rating_keyboard = ReplyKeyboardMarkup(
             KeyboardButton(text="⭐ 7–8"),
             KeyboardButton(text="⭐ 8+"),
         ],
-        [
-            KeyboardButton(text="🎲 Любой рейтинг"),
-        ],
-        [
-            KeyboardButton(text="⬅️ Назад к жанрам"),
-        ],
+        [KeyboardButton(text="🎲 Любой рейтинг")],
+        [KeyboardButton(text="⬅️ Назад к жанрам")],
     ],
     resize_keyboard=True
 )
@@ -143,12 +135,8 @@ year_keyboard = ReplyKeyboardMarkup(
             KeyboardButton(text="📼 2000–2009"),
             KeyboardButton(text="📺 До 2000"),
         ],
-        [
-            KeyboardButton(text="🎲 Любой год"),
-        ],
-        [
-            KeyboardButton(text="⬅️ Назад к рейтингу"),
-        ],
+        [KeyboardButton(text="🎲 Любой год")],
+        [KeyboardButton(text="⬅️ Назад к рейтингу")],
     ],
     resize_keyboard=True
 )
@@ -176,9 +164,7 @@ country_keyboard = ReplyKeyboardMarkup(
             KeyboardButton(text="🇮🇳 Индия"),
             KeyboardButton(text="🇩🇪 Германия"),
         ],
-        [
-            KeyboardButton(text="⬅️ Назад к году"),
-        ],
+        [KeyboardButton(text="⬅️ Назад к году")],
     ],
     resize_keyboard=True
 )
@@ -326,31 +312,31 @@ def get_rating_settings(rating_text: str) -> dict:
         "⭐ 1–4": {
             "min_rating": 1.0,
             "max_rating": 4.99,
-            "min_votes": 50,
+            "min_votes": 20,
             "sort_by": "popularity.desc",
         },
         "⭐ 5–6": {
             "min_rating": 5.0,
             "max_rating": 6.99,
-            "min_votes": 100,
+            "min_votes": 50,
             "sort_by": "popularity.desc",
         },
         "⭐ 7–8": {
             "min_rating": 7.0,
             "max_rating": 8.99,
-            "min_votes": 300,
+            "min_votes": 150,
             "sort_by": "popularity.desc",
         },
         "⭐ 8+": {
             "min_rating": 8.0,
             "max_rating": 10.0,
-            "min_votes": 1000,
+            "min_votes": 500,
             "sort_by": "vote_average.desc",
         },
         "🎲 Любой рейтинг": {
             "min_rating": 0.0,
             "max_rating": 10.0,
-            "min_votes": 100,
+            "min_votes": 50,
             "sort_by": "popularity.desc",
         },
     }
@@ -360,7 +346,7 @@ def get_rating_settings(rating_text: str) -> dict:
         {
             "min_rating": 0.0,
             "max_rating": 10.0,
-            "min_votes": 100,
+            "min_votes": 50,
             "sort_by": "popularity.desc",
         }
     )
@@ -418,6 +404,84 @@ def get_country_settings(country_text: str) -> dict:
     }
 
 
+def build_tmdb_params(
+    genre_text: str,
+    rating_settings: dict,
+    year_settings: dict,
+    country_settings: dict,
+    min_votes_override: int | None = None
+):
+    genre_id = get_genre_id(genre_text)
+    country_code = country_settings.get("country_code")
+
+    params = {
+        "api_key": TMDB_API_KEY,
+        "language": "ru-RU",
+        "sort_by": rating_settings["sort_by"],
+        "vote_average.gte": rating_settings["min_rating"],
+        "vote_average.lte": rating_settings["max_rating"],
+        "vote_count.gte": min_votes_override
+        if min_votes_override is not None
+        else rating_settings["min_votes"],
+        "include_adult": "false",
+        "page": 1,
+    }
+
+    if genre_id:
+        params["with_genres"] = genre_id
+
+    if year_settings["from_date"]:
+        params["primary_release_date.gte"] = year_settings["from_date"]
+
+    if year_settings["to_date"]:
+        params["primary_release_date.lte"] = year_settings["to_date"]
+
+    if country_code:
+        params["with_origin_country"] = country_code
+
+    return params
+
+
+async def fetch_movies_from_tmdb(session: aiohttp.ClientSession, params: dict):
+    url = "https://api.themoviedb.org/3/discover/movie"
+
+    async with session.get(url, params=params) as response:
+        if response.status != 200:
+            return [], 0
+
+        data = await response.json()
+        movies = data.get("results", [])
+        total_pages = data.get("total_pages", 0)
+
+        return movies, total_pages
+
+
+async def collect_movies_from_pages(session: aiohttp.ClientSession, params: dict):
+    first_page_params = params.copy()
+    first_page_params["page"] = 1
+
+    movies, total_pages = await fetch_movies_from_tmdb(session, first_page_params)
+
+    if total_pages <= 1:
+        return movies
+
+    max_page = min(total_pages, 20)
+
+    pages = list(range(2, max_page + 1))
+    random.shuffle(pages)
+
+    selected_pages = pages[:5]
+
+    for page in selected_pages:
+        page_params = params.copy()
+        page_params["page"] = page
+
+        page_movies, _ = await fetch_movies_from_tmdb(session, page_params)
+        movies.extend(page_movies)
+
+    return movies
+
+
 async def get_movie_by_filters(
     user_id: int,
     genre_text: str,
@@ -425,57 +489,42 @@ async def get_movie_by_filters(
     year_settings: dict,
     country_settings: dict
 ):
-    genre_id = get_genre_id(genre_text)
-    country_code = country_settings.get("country_code")
-
     seen_movies = user_seen_movies.get(user_id, set())
 
-    for _ in range(5):
-        params = {
-            "api_key": TMDB_API_KEY,
-            "language": "ru-RU",
-            "sort_by": rating_settings["sort_by"],
-            "vote_average.gte": rating_settings["min_rating"],
-            "vote_average.lte": rating_settings["max_rating"],
-            "vote_count.gte": rating_settings["min_votes"],
-            "include_adult": "false",
-            "page": random.randint(1, 10),
-        }
+    async with aiohttp.ClientSession() as session:
+        params = build_tmdb_params(
+            genre_text,
+            rating_settings,
+            year_settings,
+            country_settings
+        )
 
-        if genre_id:
-            params["with_genres"] = genre_id
+        movies = await collect_movies_from_pages(session, params)
 
-        if year_settings["from_date"]:
-            params["primary_release_date.gte"] = year_settings["from_date"]
+        if not movies and rating_settings["min_votes"] > 0:
+            soft_params = build_tmdb_params(
+                genre_text,
+                rating_settings,
+                year_settings,
+                country_settings,
+                min_votes_override=0
+            )
 
-        if year_settings["to_date"]:
-            params["primary_release_date.lte"] = year_settings["to_date"]
+            movies = await collect_movies_from_pages(session, soft_params)
 
-        if country_code:
-            params["with_origin_country"] = country_code
+    if not movies:
+        return None
 
-        url = "https://api.themoviedb.org/3/discover/movie"
+    unseen_movies = [
+        movie for movie in movies
+        if movie.get("id") not in seen_movies
+    ]
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                if response.status != 200:
-                    return None
+    if unseen_movies:
+        return random.choice(unseen_movies)
 
-                data = await response.json()
-                movies = data.get("results", [])
-
-                if not movies:
-                    continue
-
-                unseen_movies = [
-                    movie for movie in movies
-                    if movie.get("id") not in seen_movies
-                ]
-
-                if unseen_movies:
-                    return random.choice(unseen_movies)
-
-    return None
+    user_seen_movies[user_id] = set()
+    return random.choice(movies)
 
 
 def get_movie_links(movie: dict):
@@ -619,8 +668,8 @@ async def send_movie(
 
     if not movie:
         await message.answer(
-            "Не смог найти новый фильм 😢\n"
-            "Попробуй выбрать другой жанр, рейтинг, год или страну."
+            "Не смог найти фильм по таким фильтрам 😢\n"
+            "Попробуй выбрать более широкий год, рейтинг или любую страну."
         )
         return
 
@@ -680,9 +729,10 @@ async def help_message(message: Message):
         "Нажми «🎬 Подобрать фильм», выбери жанр, "
         "потом диапазон рейтинга, год и страну, "
         "и я найду фильм через TMDB API.\n\n"
+        "Если бот ничего не нашёл, попробуй выбрать более широкий фильтр: "
+        "например «Любой год» или «Любая страна».\n\n"
         "Понравился фильм? Нажми «⭐ В избранное», "
-        "и он сохранится в твоём списке.\n\n"
-        "В разделе «⭐ Избранное» можно удалить конкретный фильм."
+        "и он сохранится в твоём списке."
     )
 
 
@@ -905,8 +955,8 @@ async def another_movie(callback: CallbackQuery):
 
     if not movie:
         await callback.message.answer(
-            "Не смог найти новый фильм 😢\n"
-            "Попробуй выбрать другой жанр, рейтинг, год или страну."
+            "Не смог найти новый фильм по таким фильтрам 😢\n"
+            "Попробуй выбрать более широкий год, рейтинг или любую страну."
         )
         return
 
