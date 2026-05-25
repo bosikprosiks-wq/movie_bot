@@ -40,21 +40,34 @@ if not TMDB_API_KEY:
 
 dp = Dispatcher()
 
+user_last_media = {}
 user_last_genre = {}
 user_last_rating = {}
 user_last_year = {}
 user_last_country = {}
 user_last_filter_key = {}
-last_movies = {}
+last_items = {}
 
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🎬 Подобрать фильм")],
+        [KeyboardButton(text="🎬 Подобрать")],
         [
             KeyboardButton(text="⭐ Избранное"),
             KeyboardButton(text="ℹ️ Помощь"),
         ],
+    ],
+    resize_keyboard=True
+)
+
+
+media_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="🎬 Фильмы"),
+            KeyboardButton(text="📺 Сериалы"),
+        ],
+        [KeyboardButton(text="⬅️ Назад")],
     ],
     resize_keyboard=True
 )
@@ -102,7 +115,7 @@ genre_keyboard = ReplyKeyboardMarkup(
             KeyboardButton(text="🤠 Вестерн"),
             KeyboardButton(text="📺 ТВ-фильм"),
         ],
-        [KeyboardButton(text="⬅️ Назад")],
+        [KeyboardButton(text="⬅️ Назад к типу")],
     ],
     resize_keyboard=True
 )
@@ -207,18 +220,72 @@ def init_db():
         """
     )
 
+    try:
+        cursor.execute("ALTER TABLE favorites ADD COLUMN media_type TEXT DEFAULT 'movie'")
+    except sqlite3.OperationalError:
+        pass
+
     connection.commit()
     connection.close()
 
 
-def add_favorite(user_id: int, movie: dict):
-    title = movie.get("title") or movie.get("original_title") or "Без названия"
-    original_title = movie.get("original_title") or title
-    release_date = movie.get("release_date") or "Неизвестно"
-    year = release_date[:4] if release_date != "Неизвестно" else "Неизвестно"
-    rating = str(movie.get("vote_average", "Нет рейтинга"))
+def get_media_type_from_text(text: str) -> str:
+    if text == "📺 Сериалы":
+        return "tv"
 
-    kinopoisk_url, tmdb_url = get_movie_links(movie)
+    return "movie"
+
+
+def get_media_label(media_type: str) -> str:
+    if media_type == "tv":
+        return "Сериал"
+
+    return "Фильм"
+
+
+def get_title(item: dict) -> str:
+    return (
+        item.get("title")
+        or item.get("name")
+        or item.get("original_title")
+        or item.get("original_name")
+        or "Без названия"
+    )
+
+
+def get_original_title(item: dict) -> str:
+    return (
+        item.get("original_title")
+        or item.get("original_name")
+        or get_title(item)
+    )
+
+
+def get_release_date(item: dict) -> str:
+    return (
+        item.get("release_date")
+        or item.get("first_air_date")
+        or "Неизвестно"
+    )
+
+
+def get_release_year(item: dict) -> str:
+    release_date = get_release_date(item)
+
+    if release_date and release_date != "Неизвестно":
+        return release_date[:4]
+
+    return "Неизвестно"
+
+
+def add_favorite(user_id: int, item: dict):
+    media_type = item.get("_media_type", "movie")
+    title = get_title(item)
+    original_title = get_original_title(item)
+    year = get_release_year(item)
+    rating = str(item.get("vote_average", "Нет рейтинга"))
+
+    kinopoisk_url, tmdb_url = get_item_links(item)
 
     connection = get_connection()
     cursor = connection.cursor()
@@ -233,19 +300,21 @@ def add_favorite(user_id: int, movie: dict):
             year,
             rating,
             tmdb_url,
-            kinopoisk_url
+            kinopoisk_url,
+            media_type
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
-            movie.get("id"),
+            item.get("id"),
             title,
             original_title,
             year,
             rating,
             tmdb_url,
             kinopoisk_url,
+            media_type,
         )
     )
 
@@ -262,7 +331,7 @@ def get_favorites(user_id: int):
 
     cursor.execute(
         """
-        SELECT movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url
+        SELECT movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url, media_type
         FROM favorites
         WHERE user_id = ?
         ORDER BY id DESC
@@ -296,8 +365,8 @@ def delete_favorite(user_id: int, movie_id: int):
     return deleted
 
 
-def remember_seen_movie(user_id: int, filter_key: str, movie_id: int):
-    if not movie_id:
+def remember_seen_item(user_id: int, filter_key: str, item_id: int):
+    if not item_id:
         return
 
     connection = get_connection()
@@ -312,14 +381,14 @@ def remember_seen_movie(user_id: int, filter_key: str, movie_id: int):
         )
         VALUES (?, ?, ?)
         """,
-        (user_id, filter_key, movie_id)
+        (user_id, filter_key, item_id)
     )
 
     connection.commit()
     connection.close()
 
 
-def get_seen_movie_ids(user_id: int, filter_key: str):
+def get_seen_item_ids(user_id: int, filter_key: str):
     connection = get_connection()
     cursor = connection.cursor()
 
@@ -338,7 +407,7 @@ def get_seen_movie_ids(user_id: int, filter_key: str):
     return {row[0] for row in rows}
 
 
-def reset_seen_movies_for_user(user_id: int, filter_key: str | None = None):
+def reset_seen_items_for_user(user_id: int, filter_key: str | None = None):
     connection = get_connection()
     cursor = connection.cursor()
 
@@ -363,8 +432,8 @@ def reset_seen_movies_for_user(user_id: int, filter_key: str | None = None):
     connection.close()
 
 
-def get_genre_id(genre_text: str) -> str:
-    genres = {
+def get_genre_id(genre_text: str, media_type: str) -> str:
+    movie_genres = {
         "🎭 Любой жанр": "",
         "😂 Комедия": "35",
         "🚀 Фантастика": "878",
@@ -387,7 +456,33 @@ def get_genre_id(genre_text: str) -> str:
         "📺 ТВ-фильм": "10770",
     }
 
-    return genres.get(genre_text, "")
+    tv_genres = {
+        "🎭 Любой жанр": "",
+        "😂 Комедия": "35",
+        "🚀 Фантастика": "10765",
+        "😱 Ужасы": "9648",
+        "🔫 Боевик": "10759",
+        "🧨 Триллер": "9648",
+        "🕵️ Детектив": "9648",
+        "🧟 Криминал": "80",
+        "❤️ Романтика": "18",
+        "🐉 Фэнтези": "10765",
+        "🎬 Драма": "18",
+        "🗺 Приключения": "10759",
+        "🧒 Семейный": "10751",
+        "🎞 Мультфильм": "16",
+        "📚 История": "10768",
+        "⚔️ Военный": "10768",
+        "🎵 Музыка": "",
+        "📺 Документальный": "99",
+        "🤠 Вестерн": "37",
+        "📺 ТВ-фильм": "",
+    }
+
+    if media_type == "tv":
+        return tv_genres.get(genre_text, "")
+
+    return movie_genres.get(genre_text, "")
 
 
 def get_rating_settings(rating_text: str) -> dict:
@@ -503,17 +598,21 @@ def get_country_settings(country_text: str) -> dict:
 
 
 def build_filter_key(
+    media_type: str,
     genre_text: str,
     rating_settings: dict,
     year_settings: dict,
     country_settings: dict
 ) -> str:
-    genre_id = get_genre_id(genre_text) or "any"
+    genre_id = get_genre_id(genre_text, media_type) or "any"
     rating_name = rating_settings.get("name", "any")
     year_name = year_settings.get("name", "any")
     country_name = country_settings.get("name", "any")
 
-    return f"genre={genre_id}|rating={rating_name}|year={year_name}|country={country_name}"
+    return (
+        f"media={media_type}|genre={genre_id}|"
+        f"rating={rating_name}|year={year_name}|country={country_name}"
+    )
 
 
 def get_min_votes_steps(rating_settings: dict, country_settings: dict) -> list[int]:
@@ -551,13 +650,14 @@ def get_min_votes_steps(rating_settings: dict, country_settings: dict) -> list[i
 
 
 def build_tmdb_params(
+    media_type: str,
     genre_text: str,
     rating_settings: dict,
     year_settings: dict,
     country_settings: dict,
     min_votes: int
 ):
-    genre_id = get_genre_id(genre_text)
+    genre_id = get_genre_id(genre_text, media_type)
     country_code = country_settings.get("country_code")
 
     params = {
@@ -574,11 +674,18 @@ def build_tmdb_params(
     if genre_id:
         params["with_genres"] = genre_id
 
-    if year_settings["from_date"]:
-        params["primary_release_date.gte"] = year_settings["from_date"]
+    if media_type == "tv":
+        if year_settings["from_date"]:
+            params["first_air_date.gte"] = year_settings["from_date"]
 
-    if year_settings["to_date"]:
-        params["primary_release_date.lte"] = year_settings["to_date"]
+        if year_settings["to_date"]:
+            params["first_air_date.lte"] = year_settings["to_date"]
+    else:
+        if year_settings["from_date"]:
+            params["primary_release_date.gte"] = year_settings["from_date"]
+
+        if year_settings["to_date"]:
+            params["primary_release_date.lte"] = year_settings["to_date"]
 
     if country_code:
         params["with_origin_country"] = country_code
@@ -586,28 +693,43 @@ def build_tmdb_params(
     return params
 
 
-async def fetch_movies_from_tmdb(session: aiohttp.ClientSession, params: dict):
-    url = "https://api.themoviedb.org/3/discover/movie"
+async def fetch_items_from_tmdb(
+    session: aiohttp.ClientSession,
+    media_type: str,
+    params: dict
+):
+    if media_type == "tv":
+        url = "https://api.themoviedb.org/3/discover/tv"
+    else:
+        url = "https://api.themoviedb.org/3/discover/movie"
 
     async with session.get(url, params=params) as response:
         if response.status != 200:
             return [], 0
 
         data = await response.json()
-        movies = data.get("results", [])
+        items = data.get("results", [])
         total_pages = data.get("total_pages", 0)
 
-        return movies, total_pages
+        return items, total_pages
 
 
-async def collect_movies_from_pages(session: aiohttp.ClientSession, params: dict):
+async def collect_items_from_pages(
+    session: aiohttp.ClientSession,
+    media_type: str,
+    params: dict
+):
     first_page_params = params.copy()
     first_page_params["page"] = 1
 
-    movies, total_pages = await fetch_movies_from_tmdb(session, first_page_params)
+    items, total_pages = await fetch_items_from_tmdb(
+        session,
+        media_type,
+        first_page_params
+    )
 
     if total_pages <= 1:
-        return movies
+        return items
 
     max_page = min(total_pages, 30)
 
@@ -620,34 +742,41 @@ async def collect_movies_from_pages(session: aiohttp.ClientSession, params: dict
         page_params = params.copy()
         page_params["page"] = page
 
-        page_movies, _ = await fetch_movies_from_tmdb(session, page_params)
-        movies.extend(page_movies)
+        page_items, _ = await fetch_items_from_tmdb(
+            session,
+            media_type,
+            page_params
+        )
+        items.extend(page_items)
 
-    return movies
+    return items
 
 
-async def get_movie_by_filters(
+async def get_item_by_filters(
     user_id: int,
+    media_type: str,
     genre_text: str,
     rating_settings: dict,
     year_settings: dict,
     country_settings: dict
 ):
     filter_key = build_filter_key(
+        media_type,
         genre_text,
         rating_settings,
         year_settings,
         country_settings
     )
 
-    seen_movies = get_seen_movie_ids(user_id, filter_key)
+    seen_items = get_seen_item_ids(user_id, filter_key)
     min_votes_steps = get_min_votes_steps(rating_settings, country_settings)
 
-    all_movies_found = []
+    all_items_found = []
 
     async with aiohttp.ClientSession() as session:
         for min_votes in min_votes_steps:
             params = build_tmdb_params(
+                media_type,
                 genre_text,
                 rating_settings,
                 year_settings,
@@ -655,64 +784,70 @@ async def get_movie_by_filters(
                 min_votes
             )
 
-            movies = await collect_movies_from_pages(session, params)
+            items = await collect_items_from_pages(session, media_type, params)
 
-            if not movies:
+            if not items:
                 continue
 
-            unique_movies = {}
-            for movie in movies:
-                movie_id = movie.get("id")
-                if movie_id:
-                    unique_movies[movie_id] = movie
+            unique_items = {}
+            for item in items:
+                item_id = item.get("id")
+                if item_id:
+                    unique_items[item_id] = item
 
-            movies = list(unique_movies.values())
-            all_movies_found.extend(movies)
+            items = list(unique_items.values())
+            all_items_found.extend(items)
 
-            unseen_movies = [
-                movie for movie in movies
-                if movie.get("id") not in seen_movies
+            unseen_items = [
+                item for item in items
+                if item.get("id") not in seen_items
             ]
 
-            if unseen_movies:
+            if unseen_items:
+                selected_item = random.choice(unseen_items)
+                selected_item["_media_type"] = media_type
+
                 return {
                     "status": "ok",
-                    "movie": random.choice(unseen_movies),
+                    "item": selected_item,
                     "filter_key": filter_key,
                     "used_min_votes": min_votes,
                 }
 
-    if not all_movies_found:
+    if not all_items_found:
         return {
             "status": "not_found",
-            "movie": None,
+            "item": None,
             "filter_key": filter_key,
             "used_min_votes": None,
         }
 
     return {
         "status": "exhausted",
-        "movie": None,
+        "item": None,
         "filter_key": filter_key,
         "used_min_votes": None,
     }
 
 
-def get_movie_links(movie: dict):
-    title = movie.get("title") or movie.get("original_title") or "Без названия"
-    release_date = movie.get("release_date") or "Неизвестно"
-    year = release_date[:4] if release_date != "Неизвестно" else ""
+def get_item_links(item: dict):
+    media_type = item.get("_media_type", "movie")
+    title = get_title(item)
+    year = get_release_year(item)
 
     kinopoisk_query = quote_plus(f"{title} {year}")
     kinopoisk_url = f"https://www.kinopoisk.ru/index.php?kp_query={kinopoisk_query}"
 
-    tmdb_url = f"https://www.themoviedb.org/movie/{movie.get('id')}"
+    if media_type == "tv":
+        tmdb_url = f"https://www.themoviedb.org/tv/{item.get('id')}"
+    else:
+        tmdb_url = f"https://www.themoviedb.org/movie/{item.get('id')}"
 
     return kinopoisk_url, tmdb_url
 
 
-def get_poster_url(movie: dict):
-    poster_path = movie.get("poster_path")
+def get_poster_url(item: dict):
+    poster_path = item.get("poster_path")
 
     if not poster_path:
         return None
@@ -720,9 +855,9 @@ def get_poster_url(movie: dict):
     return f"https://image.tmdb.org/t/p/w500{poster_path}"
 
 
-def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
-    kinopoisk_url, tmdb_url = get_movie_links(movie)
-    movie_id = movie.get("id")
+def build_item_keyboard(item: dict) -> InlineKeyboardMarkup:
+    kinopoisk_url, tmdb_url = get_item_links(item)
+    item_id = item.get("id")
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -731,22 +866,22 @@ def build_movie_keyboard(movie: dict) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🌐 TMDB", url=tmdb_url),
             ],
             [
-                InlineKeyboardButton(text="⭐ В избранное", callback_data=f"favorite:{movie_id}"),
+                InlineKeyboardButton(text="⭐ В избранное", callback_data=f"favorite:{item_id}"),
             ],
             [
-                InlineKeyboardButton(text="🔁 Другой фильм", callback_data="another_movie"),
+                InlineKeyboardButton(text="🔁 Другой вариант", callback_data="another_item"),
             ],
         ]
     )
 
 
-def build_no_more_movies_keyboard() -> InlineKeyboardMarkup:
+def build_no_more_items_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="🔄 Сбросить повторы",
-                    callback_data="reset_seen_movies"
+                    callback_data="reset_seen_items"
                 ),
             ],
         ]
@@ -770,17 +905,20 @@ def build_favorite_keyboard(movie_id: int, kinopoisk_url: str, tmdb_url: str) ->
     )
 
 
-def build_movie_text(movie: dict) -> str:
-    title = movie.get("title") or movie.get("original_title") or "Без названия"
-    original_title = movie.get("original_title") or title
-    release_date = movie.get("release_date") or "Неизвестно"
-    year = release_date[:4] if release_date != "Неизвестно" else "Неизвестно"
-    rating = movie.get("vote_average", "Нет рейтинга")
-    votes = movie.get("vote_count", 0)
-    description = movie.get("overview") or "Описание отсутствует."
+def build_item_text(item: dict) -> str:
+    media_type = item.get("_media_type", "movie")
+    media_label = get_media_label(media_type)
+
+    title = get_title(item)
+    original_title = get_original_title(item)
+    year = get_release_year(item)
+    rating = item.get("vote_average", "Нет рейтинга")
+    votes = item.get("vote_count", 0)
+    description = item.get("overview") or "Описание отсутствует."
 
     return (
         f"🎬 <b>{title}</b>\n"
+        f"📌 Тип: {media_label}\n"
         f"🌍 Оригинальное название: {original_title}\n"
         f"📅 Год: {year}\n"
         f"⭐ Рейтинг TMDB: {rating}/10\n"
@@ -789,68 +927,77 @@ def build_movie_text(movie: dict) -> str:
     )
 
 
-def build_favorite_text(title: str, original_title: str, year: str, rating: str) -> str:
+def build_favorite_text(
+    title: str,
+    original_title: str,
+    year: str,
+    rating: str,
+    media_type: str
+) -> str:
     return (
         f"🎬 <b>{title}</b>\n"
+        f"📌 Тип: {get_media_label(media_type)}\n"
         f"🌍 Оригинальное название: {original_title}\n"
         f"📅 Год: {year}\n"
         f"⭐ Рейтинг TMDB: {rating}/10"
     )
 
 
-async def send_movie_card(message: Message, movie: dict):
-    movie_text = build_movie_text(movie)
-    movie_keyboard = build_movie_keyboard(movie)
-    poster_url = get_poster_url(movie)
+async def send_item_card(message: Message, item: dict):
+    item_text = build_item_text(item)
+    item_keyboard = build_item_keyboard(item)
+    poster_url = get_poster_url(item)
 
     if poster_url:
         await message.answer_photo(
             photo=poster_url,
-            caption=movie_text,
+            caption=item_text,
             parse_mode="HTML",
-            reply_markup=movie_keyboard
+            reply_markup=item_keyboard
         )
     else:
         await message.answer(
-            movie_text,
+            item_text,
             parse_mode="HTML",
-            reply_markup=movie_keyboard
+            reply_markup=item_keyboard
         )
 
 
-async def send_no_movies_message(message: Message, exhausted: bool):
+async def send_no_items_message(message: Message, exhausted: bool):
     if exhausted:
         await message.answer(
-            "По этому запросу больше нет новых фильмов 😢\n\n"
+            "По этому запросу больше нет новых вариантов 😢\n\n"
             "Попробуй изменить фильтры:\n"
             "• выбрать другой рейтинг;\n"
             "• выбрать другой год;\n"
             "• выбрать другую страну;\n"
             "• выбрать «Любая страна» или «Любой год».\n\n"
-            "Либо можешь сбросить повторы и начать показывать фильмы заново.",
-            reply_markup=build_no_more_movies_keyboard()
+            "Либо можешь сбросить повторы и начать показывать варианты заново.",
+            reply_markup=build_no_more_items_keyboard()
         )
     else:
         await message.answer(
-            "Не смог найти фильм по таким фильтрам 😢\n\n"
+            "Не смог найти вариант по таким фильтрам 😢\n\n"
             "Попробуй выбрать более широкий фильтр: "
             "например «Любой год», «Любая страна» или другой рейтинг."
         )
 
 
-async def send_movie(
+async def send_item(
     message: Message,
+    media_type: str,
     genre_text: str,
     rating_settings: dict,
     year_settings: dict,
     country_settings: dict
 ):
-    await message.answer("Ищу фильм... 🎬")
+    await message.answer("Ищу вариант... 🎬")
 
     user_id = message.from_user.id
 
-    result = await get_movie_by_filters(
+    result = await get_item_by_filters(
         user_id,
+        media_type,
         genre_text,
         rating_settings,
         year_settings,
@@ -860,22 +1007,22 @@ async def send_movie(
     user_last_filter_key[user_id] = result["filter_key"]
 
     if result["status"] == "not_found":
-        await send_no_movies_message(message, exhausted=False)
+        await send_no_items_message(message, exhausted=False)
         return
 
     if result["status"] == "exhausted":
-        await send_no_movies_message(message, exhausted=True)
+        await send_no_items_message(message, exhausted=True)
         return
 
-    movie = result["movie"]
-    movie_id = movie.get("id")
+    item = result["item"]
+    item_id = item.get("id")
 
-    last_movies[user_id] = movie
+    last_items[user_id] = item
 
-    if movie_id:
-        remember_seen_movie(user_id, result["filter_key"], movie_id)
+    if item_id:
+        remember_seen_item(user_id, result["filter_key"], item_id)
 
-    await send_movie_card(message, movie)
+    await send_item_card(message, item)
 
 
 @dp.message(CommandStart())
@@ -883,17 +1030,17 @@ async def start_command(message: Message):
     await message.answer(
         "Привет! 🎬\n\n"
         "Я бот «Что посмотреть вечером».\n"
-        "Помогу подобрать фильм по жанру, рейтингу, году и стране 😎\n\n"
+        "Помогу подобрать фильм или сериал по жанру, рейтингу, году и стране 😎\n\n"
         "Выбери действие на клавиатуре ниже:",
         reply_markup=main_keyboard
     )
 
 
-@dp.message(F.text == "🎬 Подобрать фильм")
-async def choose_movie(message: Message):
+@dp.message(F.text == "🎬 Подобрать")
+async def choose_media(message: Message):
     await message.answer(
-        "Выбери жанр фильма:",
-        reply_markup=genre_keyboard
+        "Что будем искать?",
+        reply_markup=media_keyboard
     )
 
 
@@ -903,18 +1050,18 @@ async def favorites(message: Message):
 
     if not rows:
         await message.answer(
-            "У тебя пока нет избранных фильмов ⭐\n\n"
-            "Выбери фильм и нажми кнопку «⭐ В избранное»."
+            "У тебя пока нет избранного ⭐\n\n"
+            "Выбери фильм или сериал и нажми кнопку «⭐ В избранное»."
         )
         return
 
     await message.answer("⭐ <b>Твоё избранное:</b>", parse_mode="HTML")
 
     for row in rows:
-        movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url = row
+        movie_id, title, original_title, year, rating, tmdb_url, kinopoisk_url, media_type = row
 
         await message.answer(
-            build_favorite_text(title, original_title, year, rating),
+            build_favorite_text(title, original_title, year, rating, media_type or "movie"),
             parse_mode="HTML",
             disable_web_page_preview=True,
             reply_markup=build_favorite_keyboard(movie_id, kinopoisk_url, tmdb_url)
@@ -924,13 +1071,13 @@ async def favorites(message: Message):
 @dp.message(F.text == "ℹ️ Помощь")
 async def help_message(message: Message):
     await message.answer(
-        "Я помогу подобрать фильм по жанру, рейтингу, году и стране.\n\n"
-        "Нажми «🎬 Подобрать фильм», выбери жанр, "
+        "Я помогу подобрать фильм или сериал по жанру, рейтингу, году и стране.\n\n"
+        "Нажми «🎬 Подобрать», выбери тип, жанр, "
         "потом диапазон рейтинга, год и страну, "
-        "и я найду фильм через TMDB API.\n\n"
+        "и я найду вариант через TMDB API.\n\n"
         "Если бот ничего не нашёл, попробуй выбрать более широкий фильтр: "
         "например «Любой год» или «Любая страна».\n\n"
-        "Понравился фильм? Нажми «⭐ В избранное», "
+        "Понравился вариант? Нажми «⭐ В избранное», "
         "и он сохранится в твоём списке."
     )
 
@@ -943,10 +1090,18 @@ async def back_to_menu(message: Message):
     )
 
 
+@dp.message(F.text == "⬅️ Назад к типу")
+async def back_to_media(message: Message):
+    await message.answer(
+        "Что будем искать?",
+        reply_markup=media_keyboard
+    )
+
+
 @dp.message(F.text == "⬅️ Назад к жанрам")
 async def back_to_genres(message: Message):
     await message.answer(
-        "Выбери жанр фильма:",
+        "Выбери жанр:",
         reply_markup=genre_keyboard
     )
 
@@ -954,7 +1109,7 @@ async def back_to_genres(message: Message):
 @dp.message(F.text == "⬅️ Назад к рейтингу")
 async def back_to_rating(message: Message):
     await message.answer(
-        "Выбери диапазон рейтинга фильма:",
+        "Выбери диапазон рейтинга:",
         reply_markup=rating_keyboard
     )
 
@@ -962,8 +1117,24 @@ async def back_to_rating(message: Message):
 @dp.message(F.text == "⬅️ Назад к году")
 async def back_to_year(message: Message):
     await message.answer(
-        "Выбери год выпуска:",
+        "Выбери год:",
         reply_markup=year_keyboard
+    )
+
+
+@dp.message(F.text.in_([
+    "🎬 Фильмы",
+    "📺 Сериалы",
+]))
+async def media_selected(message: Message):
+    user_id = message.from_user.id
+    media_type = get_media_type_from_text(message.text)
+
+    user_last_media[user_id] = media_type
+
+    await message.answer(
+        "Выбери жанр:",
+        reply_markup=genre_keyboard
     )
 
 
@@ -991,10 +1162,18 @@ async def back_to_year(message: Message):
 ]))
 async def genre_selected(message: Message):
     user_id = message.from_user.id
+
+    if user_id not in user_last_media:
+        await message.answer(
+            "Сначала выбери, что искать: фильм или сериал.",
+            reply_markup=media_keyboard
+        )
+        return
+
     user_last_genre[user_id] = message.text
 
     await message.answer(
-        "Теперь выбери диапазон рейтинга фильма:",
+        "Теперь выбери диапазон рейтинга:",
         reply_markup=rating_keyboard
     )
 
@@ -1021,7 +1200,7 @@ async def rating_selected(message: Message):
     user_last_rating[user_id] = rating_settings
 
     await message.answer(
-        "Теперь выбери год выпуска:",
+        "Теперь выбери год:",
         reply_markup=year_keyboard
     )
 
@@ -1077,9 +1256,17 @@ async def year_selected(message: Message):
 async def country_selected(message: Message):
     user_id = message.from_user.id
 
+    media_type = user_last_media.get(user_id)
     genre_text = user_last_genre.get(user_id)
     rating_settings = user_last_rating.get(user_id)
     year_settings = user_last_year.get(user_id)
+
+    if not media_type:
+        await message.answer(
+            "Сначала выбери, что искать: фильм или сериал.",
+            reply_markup=media_keyboard
+        )
+        return
 
     if not genre_text:
         await message.answer(
@@ -1105,8 +1292,9 @@ async def country_selected(message: Message):
     country_settings = get_country_settings(message.text)
     user_last_country[user_id] = country_settings
 
-    await send_movie(
+    await send_item(
         message,
+        media_type,
         genre_text,
         rating_settings,
         year_settings,
@@ -1114,10 +1302,11 @@ async def country_selected(message: Message):
     )
 
 
-@dp.callback_query(F.data == "another_movie")
-async def another_movie(callback: CallbackQuery):
+@dp.callback_query(F.data == "another_item")
+async def another_item(callback: CallbackQuery):
     user_id = callback.from_user.id
 
+    media_type = user_last_media.get(user_id)
     genre_text = user_last_genre.get(user_id)
     rating_settings = user_last_rating.get(user_id)
     year_settings = user_last_year.get(
@@ -1136,6 +1325,10 @@ async def another_movie(callback: CallbackQuery):
         }
     )
 
+    if not media_type:
+        await callback.answer("Сначала выбери фильм или сериал 🎬", show_alert=True)
+        return
+
     if not genre_text:
         await callback.answer("Сначала выбери жанр 🎬", show_alert=True)
         return
@@ -1144,10 +1337,11 @@ async def another_movie(callback: CallbackQuery):
         await callback.answer("Сначала выбери рейтинг ⭐", show_alert=True)
         return
 
-    await callback.answer("Ищу другой фильм...")
+    await callback.answer("Ищу другой вариант...")
 
-    result = await get_movie_by_filters(
+    result = await get_item_by_filters(
         user_id,
+        media_type,
         genre_text,
         rating_settings,
         year_settings,
@@ -1158,7 +1352,7 @@ async def another_movie(callback: CallbackQuery):
 
     if result["status"] == "not_found":
         await callback.message.answer(
-            "Не смог найти новый фильм по таким фильтрам 😢\n\n"
+            "Не смог найти новый вариант по таким фильтрам 😢\n\n"
             "Попробуй выбрать более широкий фильтр: "
             "например «Любой год», «Любая страна» или другой рейтинг."
         )
@@ -1166,56 +1360,56 @@ async def another_movie(callback: CallbackQuery):
 
     if result["status"] == "exhausted":
         await callback.message.answer(
-            "По этому запросу больше нет новых фильмов 😢\n\n"
+            "По этому запросу больше нет новых вариантов 😢\n\n"
             "Попробуй поменять жанр, рейтинг, год или страну.\n"
             "Либо сбрось повторы и начни показ заново.",
-            reply_markup=build_no_more_movies_keyboard()
+            reply_markup=build_no_more_items_keyboard()
         )
         return
 
-    movie = result["movie"]
-    movie_id = movie.get("id")
+    item = result["item"]
+    item_id = item.get("id")
 
-    last_movies[user_id] = movie
+    last_items[user_id] = item
 
-    if movie_id:
-        remember_seen_movie(user_id, result["filter_key"], movie_id)
+    if item_id:
+        remember_seen_item(user_id, result["filter_key"], item_id)
 
-    await send_movie_card(callback.message, movie)
+    await send_item_card(callback.message, item)
 
 
-@dp.callback_query(F.data == "reset_seen_movies")
-async def reset_seen_movies(callback: CallbackQuery):
+@dp.callback_query(F.data == "reset_seen_items")
+async def reset_seen_items(callback: CallbackQuery):
     user_id = callback.from_user.id
     filter_key = user_last_filter_key.get(user_id)
 
-    reset_seen_movies_for_user(user_id, filter_key)
+    reset_seen_items_for_user(user_id, filter_key)
 
     await callback.answer("Повторы сброшены 🔄")
     await callback.message.answer(
-        "Готово! Теперь можно снова получать фильмы по этим же фильтрам."
+        "Готово! Теперь можно снова получать варианты по этим же фильтрам."
     )
 
 
 @dp.callback_query(F.data.startswith("favorite:"))
-async def add_movie_to_favorites(callback: CallbackQuery):
+async def add_item_to_favorites(callback: CallbackQuery):
     user_id = callback.from_user.id
-    movie = last_movies.get(user_id)
+    item = last_items.get(user_id)
 
-    if not movie:
-        await callback.answer("Сначала получи фильм 🎬", show_alert=True)
+    if not item:
+        await callback.answer("Сначала получи вариант 🎬", show_alert=True)
         return
 
-    added = add_favorite(user_id, movie)
+    added = add_favorite(user_id, item)
 
     if added:
-        await callback.answer("Фильм добавлен в избранное ⭐")
+        await callback.answer("Добавлено в избранное ⭐")
     else:
-        await callback.answer("Этот фильм уже есть в избранном ⭐", show_alert=True)
+        await callback.answer("Уже есть в избранном ⭐", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("delete_favorite:"))
-async def delete_movie_from_favorites(callback: CallbackQuery):
+async def delete_item_from_favorites(callback: CallbackQuery):
     user_id = callback.from_user.id
     movie_id_text = callback.data.split(":")[1]
 
@@ -1228,13 +1422,13 @@ async def delete_movie_from_favorites(callback: CallbackQuery):
     deleted = delete_favorite(user_id, movie_id)
 
     if deleted:
-        await callback.answer("Фильм удалён из избранного 🗑")
+        await callback.answer("Удалено из избранного 🗑")
         await callback.message.edit_text(
-            "🗑 Фильм удалён из избранного.",
+            "🗑 Удалено из избранного.",
             reply_markup=None
         )
     else:
-        await callback.answer("Фильм уже удалён или не найден.", show_alert=True)
+        await callback.answer("Уже удалено или не найдено.", show_alert=True)
 
 
 async def main_page(request):
